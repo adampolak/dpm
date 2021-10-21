@@ -51,6 +51,26 @@ def PredRandom(requests,sigma=0.5):
   return  [max(0,x) for x in requests+noise]
   
 
+def PredHelmbold(requests, ETA=4.0):
+  ALPHA = 0.08
+  LALPHA = np.log(1.0 - ALPHA)
+  MAX_TIMEOUT = (WAKE_UP_COSTS[-1] - WAKE_UP_COSTS[-2]) / POWER_CONSUMPTIONS[-2]
+  N = 25
+  TIMEOUT = np.array([MAX_TIMEOUT / (1.15 ** i) for i in range(N)])
+  weight = np.ones(N) / N
+  predictions = []
+  for request in requests:
+    weight = weight / np.sum(weight)
+    prediction = np.sum(TIMEOUT * weight)
+    predictions.append(prediction)
+    loss = np.abs(TIMEOUT - request) / MAX_TIMEOUT
+    weight = weight * np.exp(-ETA * loss)
+    alphas = np.exp(LALPHA * loss)
+    pool = np.sum(weight * (1 - alphas))
+    weight = weight * alphas + pool / N
+  return predictions
+
+
 # #################### Predictions end here ####################
 
 
@@ -338,10 +358,6 @@ def Online_multiple(requests, pred=[]):
         history[t].append((switch))
   return history
   
-def RandomOnline_multiple(requests, pred=[]):
-  return RhoMu_multiple(requests, [0]*len(requests), rho = np.exp(1)/(np.exp(1)-1))
-
-
 def RhoMu_multiple(requests, pred=[], rho=RHO):
   history = [] * len(requests)
   step_power=[]
@@ -353,7 +369,7 @@ def RhoMu_multiple(requests, pred=[], rho=RHO):
   for t, req in enumerate(requests):
     history.append([])
     p = np.random.rand()
-    for power,wake in zip(step_power,step_wakeup): 
+    for power,wake in zip(step_power,step_wakeup):
       scale_pred = pred[t] * power/wake
       if (CDF(mu,rho,scale_pred,1) <= p):
         break
@@ -366,6 +382,46 @@ def RhoMu_multiple(requests, pred=[], rho=RHO):
           history[t].append(switch)
   return history
 
+def RandomOnline_multiple(requests, pred=[]):
+  return RhoMu_multiple(requests, [0]*len(requests), rho = np.exp(1)/(np.exp(1)-1))
+
+def Prudent_Bp(mu, rho, pred, x):
+  Bp = 0
+  step_power=[]
+  step_wakeup = []
+  for i in range(len(POWER_CONSUMPTIONS)-1):
+    step_power.append(POWER_CONSUMPTIONS[i]-POWER_CONSUMPTIONS[i+1])
+    step_wakeup.append(WAKE_UP_COSTS[i+1]-WAKE_UP_COSTS[i])
+  for power,wake in zip(step_power,step_wakeup):
+    scale_pred = pred * power/wake
+    # CDF at t' gives us value at t = (wake/power)*t'
+    scale_x = x * power/wake
+    Bp = Bp + wake * CDF(mu, rho, scale_pred, scale_x)
+  return Bp
+
+def RhoMu_multiple_prudent(requests, pred=[], rho=RHO):
+  history = [] * len(requests)
+  mu = ParetoMu(rho)
+  for t, req in enumerate(requests):
+    history.append([])
+    for i in range(1,len(POWER_CONSUMPTIONS)):
+      p = np.random.rand()
+      if (Prudent_Bp(mu,rho,pred[t],0) >= WAKE_UP_COSTS[i]):
+        history[t].append(0)
+      elif (Prudent_Bp(mu,rho,pred[t],1) < WAKE_UP_COSTS[i]):
+        break
+      else:
+	# we switch to i once Bp = beta[i-1] + p*(beta[i] - beta[i-1])
+        switch = inverse(lambda x: Prudent_Bp(mu,rho,pred[t],x)) (WAKE_UP_COSTS[i-1] + p*(WAKE_UP_COSTS[i]-WAKE_UP_COSTS[i-1]))
+        if switch > requests[t]:
+          break
+        else:
+          history[t].append(switch)
+  return history
+
+def RandomOnline_multiple_prudent(requests, pred=[]):
+  return RhoMu_multiple_prudent(requests, [0]*len(requests), rho = np.exp(1)/(np.exp(1)-1))
+
 
 def Kumar_multiple(requests, pred=[], rho=RHO):
   history = [] * len(requests)
@@ -375,13 +431,12 @@ def Kumar_multiple(requests, pred=[], rho=RHO):
     step_power.append(POWER_CONSUMPTIONS[i]-POWER_CONSUMPTIONS[i+1])
     step_wakeup.append(WAKE_UP_COSTS[i+1]-WAKE_UP_COSTS[i])
   lambd = inverse(lambda x : x/(1-np.exp(-x))) (rho)
-  res = [0] * len(requests)  
   for t, req in enumerate(requests):
     history.append([])
     p = np.random.rand()
-    for power,wake in zip(step_power,step_wakeup): 
+    for power,wake in zip(step_power,step_wakeup):
       scale_pred = pred[t] * power/wake
-      k = lambd if scale_pred >= 1 else 1/lambd  
+      k = lambd if scale_pred >= 1 else 1/lambd
       scale_switch = np.log(1+p*(np.expm1(k)))
       switch = scale_switch * wake/power
       if switch > requests[t]:
@@ -389,7 +444,64 @@ def Kumar_multiple(requests, pred=[], rho=RHO):
       else:
         history[t].append(switch)
   return history
-  
+
+def Prudent_Bp_Kumar(lambd, pred, x):
+  Bp = 0
+  step_power=[]
+  step_wakeup = []
+  for i in range(len(POWER_CONSUMPTIONS)-1):
+    step_power.append(POWER_CONSUMPTIONS[i]-POWER_CONSUMPTIONS[i+1])
+    step_wakeup.append(WAKE_UP_COSTS[i+1]-WAKE_UP_COSTS[i])
+  for power,wake in zip(step_power,step_wakeup): 
+    scale_pred = pred * power/wake
+    # CDF at t' gives us value at t = (wake/power)*t'
+    scale_x = x * power/wake
+    k = lambd if scale_pred >= 1 else 1/lambd
+    cdf = np.expm1(scale_x) / np.expm1(k)
+    if cdf > 1: cdf = 1
+    Bp = Bp + wake * cdf
+  return Bp
+
+def Kumar_multiple_prudent(requests, pred=[], rho=RHO):
+  history = [] * len(requests)
+  lambd = inverse(lambda x : x/(1-np.exp(-x))) (rho)
+  for t, req in enumerate(requests):
+    history.append([])
+    for i in range(1,len(POWER_CONSUMPTIONS)):
+      p = np.random.rand()
+      if (Prudent_Bp_Kumar(lambd,pred[t],0) >= WAKE_UP_COSTS[i]):
+        history[t].append(0)
+      elif (Prudent_Bp_Kumar(lambd,pred[t],1) < WAKE_UP_COSTS[i]):
+        break
+      else:
+        switch = inverse(lambda x: Prudent_Bp_Kumar(lambd,pred[t],x)) (WAKE_UP_COSTS[i-1] + p*(WAKE_UP_COSTS[i]-WAKE_UP_COSTS[i-1]))
+        if switch > requests[t]:
+          break
+        else:
+          history[t].append(switch)
+  return history
+
+
+def Angelo_multiple(requests, pred=[], rho=RHO):
+  history = [] * len(requests)
+  step_power=[]
+  step_wakeup = []
+  for i in range(len(POWER_CONSUMPTIONS)-1):
+    step_power.append(POWER_CONSUMPTIONS[i]-POWER_CONSUMPTIONS[i+1])
+    step_wakeup.append(WAKE_UP_COSTS[i+1]-WAKE_UP_COSTS[i])
+  for t, req in enumerate(requests):
+    history.append([])
+    for power, wake in zip(step_power, step_wakeup):
+      scale_pred = pred[t] * power/wake
+      scale_switch = 1 if scale_pred <= 1 else rho - 1
+      switch = scale_switch * wake/power
+      if switch > requests[t]:
+        break
+      else:
+        history[t].append(switch)
+  return history
+
+
 
 # utils for Blum&Burch combination
 
@@ -520,29 +632,47 @@ def Combine_rand_multiple(requests, pred, algs, epsilon=0.1):
 
 
 
-def RobustFTP_multiple(requests, pred):
-  return Combine_rand_multiple(requests, pred, (FTP_multiple, RandomOnline_multiple))
+def RobustFTP_multiple_prudent(requests, pred):
+  return Combine_rand_multiple(requests, pred, (FTP_multiple, RandomOnline_multiple_prudent))
 
+def Robust_multiple(requests, pred, algorithm, rhos, robust_algorithm):
+  return Combine_rand_multiple(requests, pred,
+    [FTP_multiple,] + [lambda r, p : algorithm(r, p, rho) for rho in rhos] + [robust_algorithm,])
 
 def RobustKumar_multiple(requests, pred):
-  return Combine_rand_multiple(requests, pred, [
-    FTP_multiple,
-    lambda r, p : Kumar_multiple(r, p, 1.1),
-    lambda r, p : Kumar_multiple(r, p, 1.1596),
-    lambda r, p : Kumar_multiple(r, p, 1.3),
-    lambda r, p : Kumar_multiple(r, p, 1.4),
-    lambda r, p : Kumar_multiple(r, p, 1.5),
-    Online_multiple,])
-  
+  return Robust_multiple(
+    requests, pred,
+    Kumar_multiple,
+    (1.1, 1.1595, 1.3, 1.4, 1.5),
+    RandomOnline_multiple)
+
 def RobustRhoMu_multiple(requests, pred):
-  return Combine_rand_multiple(requests, pred, [
-    FTP_multiple,
-    lambda r, p : RhoMu_multiple(r, p, 1.1),
-    lambda r, p : RhoMu_multiple(r, p, 1.1596),
-    lambda r, p : RhoMu_multiple(r, p, 1.3),
-    lambda r, p : RhoMu_multiple(r, p, 1.4),
-    lambda r, p : RhoMu_multiple(r, p, 1.5),
-    Online_multiple,])
+  return Robust_multiple(
+    requests, pred,
+    RhoMu_multiple,
+    (1.1, 1.1595, 1.3, 1.4, 1.5),
+    RandomOnline_multiple)
+
+def RobustAngelo_multiple(requests, pred):
+  return Robust_multiple(
+    requests, pred,
+    Angelo_multiple,
+    (1.1, 1.1595, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9),
+    Online_multiple)
+
+def RobustKumar_multiple_prudent(requests, pred):
+  return Robust_multiple(
+    requests, pred,
+    Kumar_multiple_prudent,
+    (1.1, 1.1595, 1.3, 1.4, 1.5),
+    RandomOnline_multiple_prudent)
+
+def RobustRhoMu_multiple_prudent(requests, pred):
+  return Robust_multiple(
+    requests, pred,
+    RhoMu_multiple_prudent,
+    (1.1, 1.1595, 1.3, 1.4, 1.5),
+    RandomOnline_multiple_prudent)
 
 
 # ################### Multiple sleep states end here ###############
@@ -570,19 +700,19 @@ def RhoMu_paretomu_1_4(r,p):
   return ApplyRho(RhoMu_paretomu, 1.4)(r,p)
 def RhoMu_paretomu_1_5(r,p):
   return ApplyRho(RhoMu_paretomu, 1.5)(r,p)
-def RhoMu_multiple_1_1596(r,p):
-  return ApplyRho(RhoMu_multiple, 1.1596)(r,p)
-def RhoMu_multiple_1_216(r,p):
-  return ApplyRho(RhoMu_multiple, 1.216)(r,p)
+# def RhoMu_multiple_1_1596(r,p):
+#   return ApplyRho(RhoMu_multiple, 1.1596)(r,p)
+# def RhoMu_multiple_1_216(r,p):
+#   return ApplyRho(RhoMu_multiple, 1.216)(r,p)
 
 def KumarRandom_1_1596(r,p):
   return ApplyRho(KumarRandom, 1.1596)(r,p)
 def KumarRandom_1_216(r,p):
   return ApplyRho(KumarRandom, 1.216)(r,p)
-def Kumar_multiple_1_1596(r,p):
-  return ApplyRho(Kumar_multiple, 1.1596)(r,p)
-def Kumar_multiple_1_216(r,p):
-  return ApplyRho(Kumar_multiple, 1.216)(r,p)
+# def Kumar_multiple_1_1596(r,p):
+#   return ApplyRho(Kumar_multiple, 1.1596)(r,p)
+# def Kumar_multiple_1_216(r,p):
+#   return ApplyRho(Kumar_multiple, 1.216)(r,p)
 
 def AngelopoulosDet_1_1596(r,p):
   return ApplyRho(AngelopoulosDet, 1.1596)(r,p)
